@@ -1,125 +1,81 @@
-
+import asyncio
 from binance.client import Client
-from binance.enums import *
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import time
-import math
+from telegram import Bot
+import talib
+import numpy as np
 
-
-# Binance API Keys
+# Binance API keys
 API_KEY = "WjIxSj1ZPjptcUVNbnsZTUKlGLo8Lj6YkrvCUz8D2NZH93Yd8IUNtvHPDFOFUZ1Q"
 API_SECRET = "rWHYwxyISKFJMnsPFbaFIVrnobZFDxFj9QQyoIiZYKmZwAakub6tuP7rhqpgwzko"
 
-# Telegram Bot Token
-TELEGRAM_TOKEN = '8177261485:AAGpp3sJc7TMioXuB963CmGlrS7-znP1pQo'
+# Telegram Bot token and chat ID
+TELEGRAM_TOKEN = '7262381054:AAEZDAt4rbz5ZdD8QTaQckz6iEV64X-ykmw'
+TELEGRAM_CHAT_ID = '1042306196'
 
-
-# Initialize Binance Client
+# Initialize Binance client and Telegram bot
 client = Client(API_KEY, API_SECRET)
+bot = Bot(token=TELEGRAM_TOKEN)
 
-# Utility Functions
-def round_quantity(quantity, step_size):
-    """Round quantity to the nearest valid increment."""
-    precision = int(round(-math.log(step_size, 10), 0))
-    return round(quantity, precision)
+# Trading configuration
+EXCLUDE_COINS = ["BTCUSDT", "ETHUSDT"]  # Coins to exclude from monitoring
 
-async def place_buy_order(symbol, usdt_amount):
-    """Place a market buy order."""
-    try:
-        # Get price and calculate quantity
-        ticker = client.get_symbol_ticker(symbol=symbol)
-        price = float(ticker['price'])
-        quantity = usdt_amount / price
+async def send_telegram_message(message):
+    """Send a message via Telegram."""
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
-        # Get minimum quantity step size for the symbol
-        info = client.get_symbol_info(symbol)
-        step_size = float(next(filter(lambda f: f['filterType'] == 'LOT_SIZE', info['filters']))['stepSize'])
-        quantity = round_quantity(quantity, step_size)
+def fetch_candlestick_data(symbol, interval, limit=50):
+    """Fetch historical candlestick data."""
+    candles = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    closes = np.array([float(c[4]) for c in candles], dtype=np.float64)
+    return closes
 
-        # Place buy order
-        order = client.create_order(
-            symbol=symbol,
-            side=SIDE_BUY,
-            type=ORDER_TYPE_MARKET,
-            quantity=quantity
-        )
-        return quantity, price, order
-    except Exception as e:
-        return None, None, str(e)
+def check_conditions(symbol):
+    """Check if MA5 crosses MA10 from bottom to top."""
+    closes = fetch_candlestick_data(symbol, interval="3m")
 
-async def place_sell_order(symbol, quantity, target_price):
-    """Place a market sell order."""
-    try:
-        order = client.create_order(
-            symbol=symbol,
-            side=SIDE_SELL,
-            type=ORDER_TYPE_LIMIT,
-            quantity=quantity,
-            price=f"{target_price:.2f}",
-            timeInForce=TIME_IN_FORCE_GTC
-        )
-        return order
-    except Exception as e:
-        return str(e)
+    if len(closes) < 10:  # Ensure there are enough data points
+        return False
 
-# Telegram Bot Handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a welcome message when the bot starts."""
-    await update.message.reply_text("Welcome to the Auto Trading Bot! Use /trade <symbol> to start trading.")
+    # Calculate moving averages
+    ma5 = talib.SMA(closes, timeperiod=5)
+    ma10 = talib.SMA(closes, timeperiod=10)
 
-async def trade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle trading requests."""
-    if len(context.args) != 1:
-        await update.message.reply_text("Please provide a valid coin symbol (e.g., /trade BTCUSDT).")
-        return
+    # Check if MA5 crosses MA10 from bottom to top
+    if ma5[-1] > ma10[-1] and ma5[-2] <= ma10[-2]:
+        return True
 
-    symbol = context.args[0].upper()
-    usdt_amount = 200
-    profit_percent = 1.2
+    return False
 
-    # Place buy order
-    await update.message.reply_text(f"Placing a buy order for {symbol} with {usdt_amount} USDT...")
-    quantity, buy_price, result = await place_buy_order(symbol, usdt_amount)
-    
-    if not quantity:
-        await update.message.reply_text(f"Error placing buy order: {result}")
-        return
+def get_active_pairs():
+    """Fetch active USDT pairs."""
+    exchange_info = client.get_exchange_info()
+    active_pairs = []
+    for symbol_info in exchange_info["symbols"]:
+        if (
+            symbol_info["status"] == "TRADING"
+            and symbol_info["symbol"].endswith("USDT")
+            and symbol_info["symbol"] not in EXCLUDE_COINS
+        ):
+            active_pairs.append(symbol_info["symbol"])
+    return active_pairs
 
-    await update.message.reply_text(f"Bought {quantity} {symbol} at {buy_price} USDT.")
-
-    # Calculate target sell price
-    target_price = buy_price * (1 + profit_percent / 100)
-    target_price = round(target_price, 2)  # Round target price to 2 decimal places
-
-    # Monitor price and place sell order
-    await update.message.reply_text(f"Monitoring price to sell at {target_price} USDT...")
+async def main():
+    """Main monitoring loop."""
     while True:
-        ticker = client.get_symbol_ticker(symbol=symbol)
-        current_price = float(ticker['price'])
+        try:
+            # Fetch all active USDT pairs
+            active_pairs = get_active_pairs()
 
-        if current_price >= target_price:
-            sell_result = await place_sell_order(symbol, quantity, target_price)
-            if isinstance(sell_result, str):
-                await update.message.reply_text(f"Error placing sell order: {sell_result}")
-            else:
-                await update.message.reply_text(f"Sold {quantity} {symbol} at {target_price} USDT!")
-            break
-        else:
-            time.sleep(5)
-
-# Main Function
-def main():
-    """Start the Telegram bot."""
-    # Initialize the application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Register command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("trade", trade))
-
-    # Start the bot
-    application.run_polling()
+            for symbol in active_pairs:
+                if check_conditions(symbol):
+                    await send_telegram_message(
+                        f"🔔 CONDITION MET\nSymbol: {symbol}\n"
+                        "MA5 crossed MA10 from bottom to top on the 3-minute timeframe."
+                    )
+                await asyncio.sleep(1)  # Avoid hitting API limits
+        except Exception as e:
+            await send_telegram_message(f"⚠️ An error occurred: {str(e)}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
